@@ -30,10 +30,20 @@ KNOWN_IDS_FILE = Path("known_ids.json")
 DATA_DIR = Path("data")
 LATEST_FILE = DATA_DIR / "properties.json"
 
+# --------------------------------------------------------------------
+# Logging configuration (dual output)
+# --------------------------------------------------------------------
+log_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+file_handler = logging.FileHandler("scrape.log")
+file_handler.setFormatter(log_formatter)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+
 logging.basicConfig(
-    filename="scrape.log",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[file_handler, stream_handler]
 )
 
 # --------------------------------------------------------------------
