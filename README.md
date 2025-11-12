@@ -1,6 +1,7 @@
 # 🏠 Property Scraper API
 
-A lightweight **FastAPI** web service for scraping and storing paginated property listings from a public real estate website.  
+A lightweight **FastAPI** web service for scraping and storing paginated property listings from a public real estate website.
+
 It dynamically detects pagination, stores all property data as structured JSON, and exposes multiple routes for testing, syncing, and analysis.
 
 ---
@@ -15,3 +16,4 @@ It dynamically detects pagination, stores all property data as structured JSON, 
 - **Secure Access** – Protects routes with an `X-API-Key` header using `ZAPIER_SECRET`.  
 - **Diagnostics & Debugging Tools** – Includes `/test-page` and `/debug-html` for troubleshooting.  
 - **Graceful Kill Switch** – Stop scraping instantly using `/kill`.
+
