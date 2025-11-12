@@ -1,4 +1,26 @@
+# Python
 __pycache__/
-*.log
-*.json
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Env
 .env
+.env.*
+venv/
+.venv/
+
+# Data + logs
+data/
+scrape.log
+known_ids.json
+
+# IDE / system files
+.DS_Store
+.idea/
+.vscode/
+
+# Render / build caches
+build/
+.cache/
