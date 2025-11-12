@@ -242,7 +242,7 @@ def root():
 
 @app.get("/test-page")
 async def test_page(page: int = 1, x_api_key: str = Header(None)):
-    """Diagnostic test endpoint — fetch and log details of one search page."""
+    """Diagnostic test endpoint — fetch one page and log all property data."""
     expected_secret = os.getenv("ZAPIER_SECRET")
     if expected_secret and x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -252,7 +252,6 @@ async def test_page(page: int = 1, x_api_key: str = Header(None)):
         r = await client.get(f"{BASE_URL}{page}", headers=headers, timeout=20)
 
         logging.info(f"[TEST-PAGE] Status={r.status_code}, URL={r.url}, Length={len(r.text)}")
-        logging.info(f"[TEST-PAGE] HTML preview:\n{r.text[:1500]}")
 
         model = await parse_model(r.text)
         if not model:
@@ -260,22 +259,24 @@ async def test_page(page: int = 1, x_api_key: str = Header(None)):
             return {
                 "page": page,
                 "status": "error",
-                "reason": "No JSON model found in page",
-                "html_preview": r.text[:500],
+                "reason": "No JSON model found in page"
             }
 
         props = model.get("properties", [])
         logging.info(f"[TEST-PAGE] ✅ Parsed {len(props)} properties from page {page}")
+        for p in props:
+            logging.info(f"[PROPERTY] {json.dumps(p, indent=2)}")
 
         return {
             "page": page,
             "status": "ok",
             "property_count": len(props),
-            "sample_properties": props[:3],
+            "properties": props,
             "pagination": {
                 "currentPage": model.get("currentPage"),
                 "totalPages": model.get("totalPages"),
             },
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
 
