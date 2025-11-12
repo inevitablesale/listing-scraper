@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import httpx, re, json, asyncio, os, logging, random, time, sys
 from datetime import datetime
 from pathlib import Path
@@ -31,9 +32,14 @@ DATA_DIR = Path("data")
 LATEST_FILE = DATA_DIR / "properties.json"
 
 # --------------------------------------------------------------------
-# Logging setup: file + stdout (so Render shows logs live)
+# Serve /data directory for Zapier access
 # --------------------------------------------------------------------
 DATA_DIR.mkdir(exist_ok=True)
+app.mount("/data", StaticFiles(directory="data"), name="data")
+
+# --------------------------------------------------------------------
+# Logging setup: file + stdout (so Render shows logs live)
+# --------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -75,13 +81,16 @@ def make_slug(address, city, state, zip_code):
     slug = re.sub(r"[^a-z0-9]+", "-", raw.lower().strip())
     return slug.strip("-")
 
+
 def load_known_ids():
     if KNOWN_IDS_FILE.exists():
         return set(json.loads(KNOWN_IDS_FILE.read_text()))
     return set()
 
+
 def save_known_ids(ids):
     KNOWN_IDS_FILE.write_text(json.dumps(list(ids)))
+
 
 def save_properties_to_disk(data):
     DATA_DIR.mkdir(exist_ok=True)
@@ -91,6 +100,7 @@ def save_properties_to_disk(data):
     snapshot.write_text(json.dumps(data, indent=2))
     logging.info(f"✅ Saved new snapshot: {snapshot}")
 
+    # keep last 5 snapshots
     snapshots = sorted(DATA_DIR.glob("properties_*.json"), key=os.path.getmtime, reverse=True)
     for old in snapshots[5:]:
         try:
@@ -98,6 +108,7 @@ def save_properties_to_disk(data):
             logging.info(f"🧹 Deleted old snapshot: {old}")
         except Exception as e:
             logging.error(f"Cleanup error {old}: {e}")
+
 
 async def parse_model(text):
     match = pattern.search(text)
@@ -109,6 +120,38 @@ async def parse_model(text):
     except Exception as e:
         logging.error(f"JSON decode error: {e}")
         return None
+
+
+def combine_snapshots():
+    """Combine and deduplicate all snapshot files into one."""
+    snapshots = sorted(DATA_DIR.glob("properties_*.json"), key=os.path.getmtime)
+    all_properties = {}
+    total_files = 0
+
+    for file in snapshots:
+        try:
+            data = json.loads(file.read_text())
+            total_files += 1
+            for p in data.get("properties", []):
+                pid = p.get("assetId")
+                if pid:
+                    all_properties[pid] = p
+        except Exception as e:
+            logging.error(f"Error reading {file}: {e}")
+
+    combined_list = list(all_properties.values())
+    combined_path = DATA_DIR / "properties_combined.json"
+    combined_data = {
+        "count": len(combined_list),
+        "unique_asset_ids": len(all_properties),
+        "source_files": total_files,
+        "properties": combined_list,
+        "fetched_at": datetime.utcnow().isoformat()
+    }
+
+    combined_path.write_text(json.dumps(combined_data, indent=2))
+    logging.info(f"🧩 Combined {total_files} snapshots into {combined_path} with {len(combined_list)} unique properties")
+    return combined_data
 
 # --------------------------------------------------------------------
 # Core scraper
@@ -175,7 +218,6 @@ async def scrape_all_pages():
         "message": "Starting scrape..."
     })
 
-    # Pick a session-level User-Agent
     session_ua = random.choice([ua.chrome, ua.firefox, ua.safari])
     session_headers = {
         "User-Agent": session_ua,
@@ -202,14 +244,12 @@ async def scrape_all_pages():
             PROGRESS.update({"page": p, "message": f"Scraping page {p}/{total_pages}"})
             logging.info(f"🧭 Scraping page {p}/{total_pages} (elapsed: {elapsed:0.1f}s)")
 
-            # Human-like delay with micro jitter
             delay = random.uniform(1.5, 3.5) + random.random() * 0.2
             await asyncio.sleep(delay)
 
             page_result = await fetch_page(client, p, session_headers)
             results.append(page_result)
 
-            # Longer cooldown every 10 pages
             if p % 10 == 0:
                 cooldown = random.uniform(5.0, 12.0) + random.random()
                 logging.info(f"🌙 Cooldown pause for {cooldown:.1f}s at page {p}.")
@@ -243,6 +283,10 @@ async def scrape_all_pages():
     }
 
     save_properties_to_disk(data)
+
+    # Auto combine after scrape
+    combine_snapshots()
+
     logging.info(f"✅ Full scrape complete — {len(all_props)} properties fetched in {duration:.1f}s.")
     PROGRESS.update({
         "running": False,
@@ -263,11 +307,13 @@ def root():
             "POST /properties (start async scrape)",
             "GET /progress (check status)",
             "GET /stored",
+            "GET /combine (combine + dedupe snapshots)",
             "GET /latest-image-urls",
             "POST /kill",
             "GET /health"
         ],
     }
+
 
 @app.post("/properties")
 async def start_properties_scrape(background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
@@ -282,9 +328,21 @@ async def start_properties_scrape(background_tasks: BackgroundTasks, x_api_key: 
     background_tasks.add_task(scrape_all_pages)
     return {"message": "Scrape started", "progress": PROGRESS}
 
+
+@app.get("/combine")
+def combine_route(x_api_key: str = Header(None)):
+    expected_secret = os.getenv("ZAPIER_SECRET")
+    if expected_secret and x_api_key != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    data = combine_snapshots()
+    return {"message": "Combined snapshots", "unique_properties": data["count"], "path": "data/properties_combined.json"}
+
+
 @app.get("/progress")
 def get_progress():
     return PROGRESS
+
 
 @app.get("/stored")
 def get_stored(x_api_key: str = Header(None)):
@@ -295,6 +353,7 @@ def get_stored(x_api_key: str = Header(None)):
     if not LATEST_FILE.exists():
         raise HTTPException(status_code=404, detail="No stored dataset found.")
     return json.loads(LATEST_FILE.read_text())
+
 
 @app.get("/latest-image-urls")
 def get_latest_image_urls(x_api_key: str = Header(None)):
@@ -308,6 +367,7 @@ def get_latest_image_urls(x_api_key: str = Header(None)):
     urls = [p["imageUrl"] for p in data.get("properties", []) if p.get("imageUrl")]
     return {"count": len(urls), "image_urls": urls}
 
+
 @app.post("/kill")
 def kill_scraper(x_api_key: str = Header(None)):
     global SCRAPE_ACTIVE
@@ -319,6 +379,7 @@ def kill_scraper(x_api_key: str = Header(None)):
     PROGRESS.update({"running": False, "message": "Scrape manually stopped"})
     logging.warning("🚨 Kill switch activated — scraping halted.")
     return {"message": "Scraper stopped successfully."}
+
 
 @app.get("/health")
 def health_check():
