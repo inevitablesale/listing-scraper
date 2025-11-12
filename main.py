@@ -23,7 +23,7 @@ app.add_middleware(
 # --------------------------------------------------------------------
 BASE_URL = "https://www.vrmproperties.com/Properties-For-Sale?currentpage="
 DETAIL_BASE = "https://www.vrmproperties.com/Property-For-Sale/"
-pattern = re.compile(r"let model\\s*=\\s*(\\{[\\s\\S]*?\\});")
+pattern = re.compile(r"let\s+model\s*=\s*(\{.*?\});", re.DOTALL)
 
 SCRAPE_ACTIVE = True
 KNOWN_IDS_FILE = Path("known_ids.json")
@@ -103,7 +103,11 @@ async def parse_model(text):
     if not match:
         return None
     cleaned = re.sub(r",(\s*[}\]])", r"\1", match.group(1))
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except Exception as e:
+        logging.error(f"JSON decode error: {e}")
+        return None
 
 # --------------------------------------------------------------------
 # Core scraper
@@ -218,11 +222,64 @@ def root():
             "/stored",
             "/latest-image-urls",
             "/test-page",
+            "/debug-html",
             "/health",
             "/kill",
         ],
         "note": "Use X-API-Key header for authentication",
     }
+
+
+@app.get("/test-page")
+async def test_page(page: int = 1, x_api_key: str = Header(None)):
+    """Diagnostic test endpoint — fetch and log details of one search page."""
+    expected_secret = os.getenv("ZAPIER_SECRET")
+    if expected_secret and x_api_key != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    async with httpx.AsyncClient() as client:
+        headers = random_headers()
+        r = await client.get(f"{BASE_URL}{page}", headers=headers, timeout=20)
+
+        logging.info(f"[TEST-PAGE] Status={r.status_code}, URL={r.url}, Length={len(r.text)}")
+        logging.info(f"[TEST-PAGE] HTML preview:\n{r.text[:1500]}")
+
+        model = await parse_model(r.text)
+        if not model:
+            logging.warning(f"[TEST-PAGE] ❌ No JSON model found on page {page}")
+            return {
+                "page": page,
+                "status": "error",
+                "reason": "No JSON model found in page",
+                "html_preview": r.text[:500],
+            }
+
+        props = model.get("properties", [])
+        logging.info(f"[TEST-PAGE] ✅ Parsed {len(props)} properties from page {page}")
+
+        return {
+            "page": page,
+            "status": "ok",
+            "property_count": len(props),
+            "sample_properties": props[:3],
+            "pagination": {
+                "currentPage": model.get("currentPage"),
+                "totalPages": model.get("totalPages"),
+            },
+        }
+
+
+@app.get("/debug-html")
+async def debug_html(page: int = 1, x_api_key: str = Header(None)):
+    """Return HTML preview for debugging scraping issues."""
+    expected_secret = os.getenv("ZAPIER_SECRET")
+    if expected_secret and x_api_key != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    async with httpx.AsyncClient() as client:
+        headers = random_headers()
+        r = await client.get(f"{BASE_URL}{page}", headers=headers, timeout=20)
+    return {"status": r.status_code, "length": len(r.text), "preview": r.text[:500]}
 
 
 @app.get("/properties")
@@ -258,29 +315,6 @@ def get_latest_image_urls(x_api_key: str = Header(None)):
     data = json.loads(LATEST_FILE.read_text())
     urls = [p["imageUrl"] for p in data.get("properties", []) if p.get("imageUrl")]
     return {"count": len(urls), "image_urls": urls}
-
-
-@app.get("/test-page")
-async def test_page(page: int = 1, x_api_key: str = Header(None)):
-    """Check connectivity and structure for a single search page."""
-    expected_secret = os.getenv("ZAPIER_SECRET")
-    if expected_secret and x_api_key != expected_secret:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    async with httpx.AsyncClient() as client:
-        result = await fetch_page(client, page)
-
-    if not result["properties"]:
-        raise HTTPException(status_code=404, detail=f"No properties found on page {page}")
-
-    sample = result["properties"][:3]
-    return {
-        "page": page,
-        "total_pages": result["pagination"].get("totalPages"),
-        "sample_properties": sample,
-        "meta": result["meta"],
-        "timestamp": datetime.utcnow().isoformat(),
-    }
 
 
 @app.get("/health")
