@@ -48,17 +48,6 @@ except Exception:
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
-def random_headers():
-    """Generate realistic browser headers per request."""
-    ua_string = random.choice([ua.chrome, ua.firefox, ua.safari])
-    return {
-        "User-Agent": ua_string,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.vrmproperties.com/Properties-For-Sale",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    }
-
 def make_slug(address, city, state, zip_code):
     if not all([address, city, state, zip_code]):
         return None
@@ -104,14 +93,14 @@ async def parse_model(text):
 # --------------------------------------------------------------------
 # Core scraper
 # --------------------------------------------------------------------
-async def fetch_page(client, page):
+async def fetch_page(client, page, session_headers):
+    """Fetch one search results page and extract property data."""
     global SCRAPE_ACTIVE
     if not SCRAPE_ACTIVE:
         return {"properties": [], "meta": None, "pagination": {}}
 
     try:
-        headers = random_headers()
-        r = await client.get(f"{BASE_URL}{page}", timeout=20, headers=headers)
+        r = await client.get(f"{BASE_URL}{page}", timeout=20, headers=session_headers)
         model = await parse_model(r.text)
         if not model:
             logging.warning(f"No JSON found on page {page}")
@@ -147,17 +136,30 @@ async def fetch_page(client, page):
         logging.error(f"Error fetching page {page}: {e}")
         return {"properties": [], "meta": None, "pagination": {}}
 
+
 async def scrape_all_pages():
-    """Scrape dynamically based on detected totalPages value, with progress tracking."""
+    """Scrape dynamically based on detected totalPages value, with human pacing and persistence."""
     global SCRAPE_ACTIVE
     SCRAPE_ACTIVE = True
 
     known = load_known_ids()
     new_ids = set()
-
     start_time = time.time()
-    async with httpx.AsyncClient() as client:
-        first = await fetch_page(client, 1)
+
+    # Pick a session-level User-Agent
+    session_ua = random.choice([ua.chrome, ua.firefox, ua.safari])
+    session_headers = {
+        "User-Agent": session_ua,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.vrmproperties.com/Properties-For-Sale",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    }
+
+    logging.info(f"🧠 Using session User-Agent: {session_ua}")
+
+    async with httpx.AsyncClient(follow_redirects=True, headers=session_headers) as client:
+        first = await fetch_page(client, 1, session_headers)
         total_pages = first["pagination"].get("totalPages", 1)
         logging.info(f"🔍 Detected {total_pages} total pages.")
 
@@ -167,16 +169,18 @@ async def scrape_all_pages():
                 break
 
             elapsed = time.time() - start_time
-            logging.info(f"🧭 Scraping page {p} of {total_pages} (elapsed: {elapsed:0.1f}s)")
+            logging.info(f"🧭 Scraping page {p}/{total_pages} (elapsed: {elapsed:0.1f}s)")
 
-            delay = random.uniform(1.0, 3.0)
+            # Human-like delay with micro jitter
+            delay = random.uniform(1.5, 3.5) + random.random() * 0.2
             await asyncio.sleep(delay)
 
-            page_result = await fetch_page(client, p)
+            page_result = await fetch_page(client, p, session_headers)
             results.append(page_result)
 
+            # Longer cooldown every 10 pages
             if p % 10 == 0:
-                cooldown = random.uniform(5.0, 10.0)
+                cooldown = random.uniform(5.0, 12.0) + random.random()
                 logging.info(f"🌙 Cooldown pause for {cooldown:.1f}s at page {p}.")
                 await asyncio.sleep(cooldown)
 
