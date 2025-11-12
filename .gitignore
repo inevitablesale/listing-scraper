@@ -1,6 +1,4 @@
 __pycache__/
-*.pyc
-.env
-*.csv
+*.log
 *.json
-
+.env
