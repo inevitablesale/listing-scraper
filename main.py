@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx, re, json, asyncio, os, logging, random
+import httpx, re, json, asyncio, os, logging, random, time
 from datetime import datetime
 from pathlib import Path
 from fake_useragent import UserAgent, settings
@@ -8,7 +8,7 @@ from fake_useragent import UserAgent, settings
 # --------------------------------------------------------------------
 # App setup
 # --------------------------------------------------------------------
-app = FastAPI(title="VRM Property Scraper")
+app = FastAPI(title="Property Scraper API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,20 +30,10 @@ KNOWN_IDS_FILE = Path("known_ids.json")
 DATA_DIR = Path("data")
 LATEST_FILE = DATA_DIR / "properties.json"
 
-# --------------------------------------------------------------------
-# Logging configuration (dual output)
-# --------------------------------------------------------------------
-log_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-file_handler = logging.FileHandler("scrape.log")
-file_handler.setFormatter(log_formatter)
-
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(log_formatter)
-
 logging.basicConfig(
+    filename="scrape.log",
     level=logging.INFO,
-    handlers=[file_handler, stream_handler]
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 # --------------------------------------------------------------------
@@ -69,28 +59,22 @@ def random_headers():
         "Connection": "keep-alive",
     }
 
-
 def make_slug(address, city, state, zip_code):
-    """Create SEO-friendly slug for property URL."""
     if not all([address, city, state, zip_code]):
         return None
     raw = f"{address} {city} {state} {zip_code}"
     slug = re.sub(r"[^a-z0-9]+", "-", raw.lower().strip())
     return slug.strip("-")
 
-
 def load_known_ids():
     if KNOWN_IDS_FILE.exists():
         return set(json.loads(KNOWN_IDS_FILE.read_text()))
     return set()
 
-
 def save_known_ids(ids):
     KNOWN_IDS_FILE.write_text(json.dumps(list(ids)))
 
-
 def save_properties_to_disk(data):
-    """Save full dataset and auto-clean old snapshots (keep last 5)."""
     DATA_DIR.mkdir(exist_ok=True)
     LATEST_FILE.write_text(json.dumps(data, indent=2))
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
@@ -106,9 +90,7 @@ def save_properties_to_disk(data):
         except Exception as e:
             logging.error(f"Cleanup error {old}: {e}")
 
-
 async def parse_model(text):
-    """Extract the embedded 'model' JSON from HTML."""
     match = pattern.search(text)
     if not match:
         return None
@@ -123,7 +105,6 @@ async def parse_model(text):
 # Core scraper
 # --------------------------------------------------------------------
 async def fetch_page(client, page):
-    """Fetch one search results page and extract property data."""
     global SCRAPE_ACTIVE
     if not SCRAPE_ACTIVE:
         return {"properties": [], "meta": None, "pagination": {}}
@@ -166,15 +147,15 @@ async def fetch_page(client, page):
         logging.error(f"Error fetching page {page}: {e}")
         return {"properties": [], "meta": None, "pagination": {}}
 
-
 async def scrape_all_pages():
-    """Scrape dynamically based on detected totalPages value."""
+    """Scrape dynamically based on detected totalPages value, with progress tracking."""
     global SCRAPE_ACTIVE
     SCRAPE_ACTIVE = True
 
     known = load_known_ids()
     new_ids = set()
 
+    start_time = time.time()
     async with httpx.AsyncClient() as client:
         first = await fetch_page(client, 1)
         total_pages = first["pagination"].get("totalPages", 1)
@@ -184,6 +165,9 @@ async def scrape_all_pages():
         for p in range(2, total_pages + 1):
             if not SCRAPE_ACTIVE:
                 break
+
+            elapsed = time.time() - start_time
+            logging.info(f"🧭 Scraping page {p} of {total_pages} (elapsed: {elapsed:0.1f}s)")
 
             delay = random.uniform(1.0, 3.0)
             await asyncio.sleep(delay)
@@ -208,6 +192,9 @@ async def scrape_all_pages():
     if new_ids:
         save_known_ids(known.union(new_ids))
 
+    end_time = time.time()
+    duration = end_time - start_time
+
     data = {
         "count": len(all_props),
         "new_discoveries": len(new_ids),
@@ -215,9 +202,13 @@ async def scrape_all_pages():
         "meta": meta,
         "pagination": first["pagination"],
         "fetched_at": datetime.utcnow().isoformat(),
+        "scrape_started_at": datetime.utcfromtimestamp(start_time).isoformat(),
+        "scrape_finished_at": datetime.utcfromtimestamp(end_time).isoformat(),
+        "duration_seconds": round(duration, 2),
     }
 
     save_properties_to_disk(data)
+    logging.info(f"✅ Full scrape complete — {len(all_props)} properties fetched in {duration:.1f}s.")
     return data
 
 # --------------------------------------------------------------------
@@ -226,7 +217,7 @@ async def scrape_all_pages():
 @app.get("/")
 def root():
     return {
-        "message": "VRM Scraper API is live!",
+        "message": "Property Scraper API is live!",
         "endpoints": [
             "/properties",
             "/stored",
@@ -239,69 +230,13 @@ def root():
         "note": "Use X-API-Key header for authentication",
     }
 
-
-@app.get("/test-page")
-async def test_page(page: int = 1, x_api_key: str = Header(None)):
-    """Diagnostic test endpoint — fetch one page and log all property data."""
-    expected_secret = os.getenv("ZAPIER_SECRET")
-    if expected_secret and x_api_key != expected_secret:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    async with httpx.AsyncClient() as client:
-        headers = random_headers()
-        r = await client.get(f"{BASE_URL}{page}", headers=headers, timeout=20)
-
-        logging.info(f"[TEST-PAGE] Status={r.status_code}, URL={r.url}, Length={len(r.text)}")
-
-        model = await parse_model(r.text)
-        if not model:
-            logging.warning(f"[TEST-PAGE] ❌ No JSON model found on page {page}")
-            return {
-                "page": page,
-                "status": "error",
-                "reason": "No JSON model found in page"
-            }
-
-        props = model.get("properties", [])
-        logging.info(f"[TEST-PAGE] ✅ Parsed {len(props)} properties from page {page}")
-        for p in props:
-            logging.info(f"[PROPERTY] {json.dumps(p, indent=2)}")
-
-        return {
-            "page": page,
-            "status": "ok",
-            "property_count": len(props),
-            "properties": props,
-            "pagination": {
-                "currentPage": model.get("currentPage"),
-                "totalPages": model.get("totalPages"),
-            },
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-
-@app.get("/debug-html")
-async def debug_html(page: int = 1, x_api_key: str = Header(None)):
-    """Return HTML preview for debugging scraping issues."""
-    expected_secret = os.getenv("ZAPIER_SECRET")
-    if expected_secret and x_api_key != expected_secret:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    async with httpx.AsyncClient() as client:
-        headers = random_headers()
-        r = await client.get(f"{BASE_URL}{page}", headers=headers, timeout=20)
-    return {"status": r.status_code, "length": len(r.text), "preview": r.text[:500]}
-
-
 @app.get("/properties")
 async def get_properties(x_api_key: str = Header(None)):
     expected_secret = os.getenv("ZAPIER_SECRET")
     if expected_secret and x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     data = await scrape_all_pages()
     return data
-
 
 @app.get("/stored")
 def get_stored(x_api_key: str = Header(None)):
@@ -313,7 +248,6 @@ def get_stored(x_api_key: str = Header(None)):
         raise HTTPException(status_code=404, detail="No stored dataset found.")
     return json.loads(LATEST_FILE.read_text())
 
-
 @app.get("/latest-image-urls")
 def get_latest_image_urls(x_api_key: str = Header(None)):
     expected_secret = os.getenv("ZAPIER_SECRET")
@@ -322,16 +256,13 @@ def get_latest_image_urls(x_api_key: str = Header(None)):
 
     if not LATEST_FILE.exists():
         raise HTTPException(status_code=404, detail="No stored dataset found.")
-
     data = json.loads(LATEST_FILE.read_text())
     urls = [p["imageUrl"] for p in data.get("properties", []) if p.get("imageUrl")]
     return {"count": len(urls), "image_urls": urls}
 
-
 @app.get("/health")
 def health_check():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
 
 @app.post("/kill")
 def kill_scraper(x_api_key: str = Header(None)):
