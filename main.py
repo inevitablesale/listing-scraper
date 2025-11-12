@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-import httpx, re, json, asyncio, os, logging, random, time
+import httpx, re, json, asyncio, os, logging, random, time, sys
 from datetime import datetime
 from pathlib import Path
 from fake_useragent import UserAgent, settings
@@ -30,11 +30,31 @@ KNOWN_IDS_FILE = Path("known_ids.json")
 DATA_DIR = Path("data")
 LATEST_FILE = DATA_DIR / "properties.json"
 
+# --------------------------------------------------------------------
+# Logging setup: file + stdout (so Render shows logs live)
+# --------------------------------------------------------------------
+DATA_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
-    filename="scrape.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler("scrape.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
+
+# --------------------------------------------------------------------
+# Scrape progress tracker
+# --------------------------------------------------------------------
+PROGRESS = {
+    "running": False,
+    "page": 0,
+    "total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "duration_seconds": None,
+    "message": "Idle"
+}
 
 # --------------------------------------------------------------------
 # Safe user-agent initialization
@@ -146,6 +166,15 @@ async def scrape_all_pages():
     new_ids = set()
     start_time = time.time()
 
+    PROGRESS.update({
+        "running": True,
+        "page": 0,
+        "total": 0,
+        "started_at": datetime.utcnow().isoformat(),
+        "finished_at": None,
+        "message": "Starting scrape..."
+    })
+
     # Pick a session-level User-Agent
     session_ua = random.choice([ua.chrome, ua.firefox, ua.safari])
     session_headers = {
@@ -161,6 +190,7 @@ async def scrape_all_pages():
     async with httpx.AsyncClient(follow_redirects=True, headers=session_headers) as client:
         first = await fetch_page(client, 1, session_headers)
         total_pages = first["pagination"].get("totalPages", 1)
+        PROGRESS["total"] = total_pages
         logging.info(f"🔍 Detected {total_pages} total pages.")
 
         results = []
@@ -169,6 +199,7 @@ async def scrape_all_pages():
                 break
 
             elapsed = time.time() - start_time
+            PROGRESS.update({"page": p, "message": f"Scraping page {p}/{total_pages}"})
             logging.info(f"🧭 Scraping page {p}/{total_pages} (elapsed: {elapsed:0.1f}s)")
 
             # Human-like delay with micro jitter
@@ -213,6 +244,12 @@ async def scrape_all_pages():
 
     save_properties_to_disk(data)
     logging.info(f"✅ Full scrape complete — {len(all_props)} properties fetched in {duration:.1f}s.")
+    PROGRESS.update({
+        "running": False,
+        "finished_at": datetime.utcnow().isoformat(),
+        "duration_seconds": round(duration, 2),
+        "message": f"Completed {len(all_props)} properties in {duration:.1f}s"
+    })
     return data
 
 # --------------------------------------------------------------------
@@ -223,24 +260,31 @@ def root():
     return {
         "message": "Property Scraper API is live!",
         "endpoints": [
-            "/properties",
-            "/stored",
-            "/latest-image-urls",
-            "/test-page",
-            "/debug-html",
-            "/health",
-            "/kill",
+            "POST /properties (start async scrape)",
+            "GET /progress (check status)",
+            "GET /stored",
+            "GET /latest-image-urls",
+            "POST /kill",
+            "GET /health"
         ],
-        "note": "Use X-API-Key header for authentication",
     }
 
-@app.get("/properties")
-async def get_properties(x_api_key: str = Header(None)):
+@app.post("/properties")
+async def start_properties_scrape(background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
     expected_secret = os.getenv("ZAPIER_SECRET")
     if expected_secret and x_api_key != expected_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    data = await scrape_all_pages()
-    return data
+
+    if PROGRESS.get("running"):
+        return {"message": "Scrape already running", "progress": PROGRESS}
+
+    logging.info("🚀 Background scrape triggered via /properties")
+    background_tasks.add_task(scrape_all_pages)
+    return {"message": "Scrape started", "progress": PROGRESS}
+
+@app.get("/progress")
+def get_progress():
+    return PROGRESS
 
 @app.get("/stored")
 def get_stored(x_api_key: str = Header(None)):
@@ -264,10 +308,6 @@ def get_latest_image_urls(x_api_key: str = Header(None)):
     urls = [p["imageUrl"] for p in data.get("properties", []) if p.get("imageUrl")]
     return {"count": len(urls), "image_urls": urls}
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
 @app.post("/kill")
 def kill_scraper(x_api_key: str = Header(None)):
     global SCRAPE_ACTIVE
@@ -276,5 +316,10 @@ def kill_scraper(x_api_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     SCRAPE_ACTIVE = False
+    PROGRESS.update({"running": False, "message": "Scrape manually stopped"})
     logging.warning("🚨 Kill switch activated — scraping halted.")
     return {"message": "Scraper stopped successfully."}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
